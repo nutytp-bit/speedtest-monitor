@@ -1,11 +1,11 @@
 import os
 import csv
+import subprocess
 from datetime import datetime
 from pathlib import Path
 import logging
 from flask import Flask, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
-import speedtest
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -24,29 +24,36 @@ def init_database():
         with open(DB_FILE, 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow(['timestamp', 'download_mbps', 'upload_mbps', 'ping_ms', 'server'])
+        logger.info("✅ Database initialized")
 
-# Run speedtest and save results
+# Run speedtest using subprocess
 def run_speedtest():
     try:
-        logger.info("Starting speedtest...")
-        st = speedtest.Speedtest()
+        logger.info("🚀 Starting speedtest...")
 
-        # Get servers
-        st.get_servers()
+        # Run speedtest-cli command
+        result = subprocess.run(
+            ['speedtest-cli', '--simple'],
+            capture_output=True,
+            text=True,
+            timeout=300
+        )
 
-        # Run test
-        st.download()
-        st.upload()
+        if result.returncode != 0:
+            logger.error(f"❌ Speedtest failed: {result.stderr}")
+            return
 
-        # Get results
-        results = st.results.dict()
+        # Parse output: download,upload,ping
+        lines = result.stdout.strip().split('\n')
+        if len(lines) < 3:
+            logger.error(f"❌ Invalid speedtest output: {result.stdout}")
+            return
 
-        # Extract data
-        timestamp = datetime.now().isoformat()
-        download = round(results['download'] / 1_000_000, 2)  # Convert to Mbps
-        upload = round(results['upload'] / 1_000_000, 2)      # Convert to Mbps
-        ping = round(results['ping'], 2)
-        server = results['server']['sponsor']
+        timestamp = datetime.utcnow().isoformat() + "Z"
+        download = round(float(lines[0]), 2)
+        upload = round(float(lines[1]), 2)
+        ping = round(float(lines[2]), 2)
+        server = "Speedtest"
 
         # Save to CSV
         with open(DB_FILE, 'a', newline='') as f:
@@ -55,22 +62,29 @@ def run_speedtest():
 
         logger.info(f"✅ Test completed | Download: {download} Mbps | Upload: {upload} Mbps | Ping: {ping} ms")
 
+    except subprocess.TimeoutExpired:
+        logger.error("❌ Speedtest timeout (took too long)")
+    except FileNotFoundError:
+        logger.error("❌ speedtest-cli not found. Try: pip install speedtest-cli")
     except Exception as e:
-        logger.error(f"❌ Speedtest failed: {str(e)}")
+        logger.error(f"❌ Speedtest error: {str(e)}")
 
 # API Endpoints
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({"status": "ok"}), 200
+    return jsonify({"status": "ok", "timestamp": datetime.utcnow().isoformat()}), 200
 
 @app.route('/latest', methods=['GET'])
 def get_latest():
     """Get latest speedtest result"""
     try:
+        if not Path(DB_FILE).exists():
+            return jsonify({"error": "No data yet", "message": "Waiting for first speedtest to complete (1-2 minutes)"}), 404
+
         with open(DB_FILE, 'r') as f:
             lines = f.readlines()
             if len(lines) <= 1:
-                return jsonify({"error": "No data yet"}), 404
+                return jsonify({"error": "No data yet", "message": "Speedtest still running or failed"}), 404
 
             last_line = lines[-1].strip().split(',')
             return jsonify({
@@ -160,7 +174,7 @@ def start_scheduler():
         replace_existing=True
     )
 
-    # Also run immediately on startup
+    # Also run immediately on startup (with delay to let app stabilize)
     scheduler.add_job(
         func=run_speedtest,
         trigger="date",
@@ -170,7 +184,7 @@ def start_scheduler():
     )
 
     scheduler.start()
-    logger.info("Scheduler started - will run speedtest every hour")
+    logger.info("✅ Scheduler started - speedtest will run every hour + now")
 
 if __name__ == '__main__':
     # Initialize database
@@ -180,5 +194,5 @@ if __name__ == '__main__':
     start_scheduler()
 
     # Run Flask app
-    logger.info(f"Starting app on port {PORT}")
+    logger.info(f"🚀 Starting app on port {PORT}")
     app.run(host='0.0.0.0', port=PORT, debug=False)
