@@ -1,14 +1,17 @@
 import os
 import csv
-import subprocess
 from datetime import datetime
 from pathlib import Path
 import logging
 from flask import Flask, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
+import speedtest
 
 # Setup logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] [%(levelname)s] %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 # Initialize Flask app
@@ -20,71 +23,78 @@ PORT = int(os.getenv("PORT", 8000))
 
 # Ensure CSV headers exist
 def init_database():
-    if not Path(DB_FILE).exists():
-        with open(DB_FILE, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(['timestamp', 'download_mbps', 'upload_mbps', 'ping_ms', 'server'])
-        logger.info("✅ Database initialized")
+    try:
+        if not Path(DB_FILE).exists():
+            with open(DB_FILE, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['timestamp', 'download_mbps', 'upload_mbps', 'ping_ms', 'server'])
+            logger.info("✅ Database initialized")
+        else:
+            logger.info("✅ Database already exists")
+    except Exception as e:
+        logger.error(f"❌ Failed to init database: {e}")
 
-# Run speedtest using subprocess
+# Run speedtest using speedtest library
 def run_speedtest():
     try:
         logger.info("🚀 Starting speedtest...")
 
-        # Run speedtest-cli command
-        result = subprocess.run(
-            ['speedtest-cli', '--simple'],
-            capture_output=True,
-            text=True,
-            timeout=300
-        )
+        st = speedtest.Speedtest()
+        logger.info("📍 Finding best server...")
+        st.get_best_server()
 
-        if result.returncode != 0:
-            logger.error(f"❌ Speedtest failed: {result.stderr}")
-            return
+        logger.info("⬇️ Testing download speed...")
+        st.download()
 
-        # Parse output: download,upload,ping
-        lines = result.stdout.strip().split('\n')
-        if len(lines) < 3:
-            logger.error(f"❌ Invalid speedtest output: {result.stdout}")
-            return
+        logger.info("⬆️ Testing upload speed...")
+        st.upload()
 
+        # Get results
+        results = st.results.dict()
+
+        # Extract data
         timestamp = datetime.utcnow().isoformat() + "Z"
-        download = round(float(lines[0]), 2)
-        upload = round(float(lines[1]), 2)
-        ping = round(float(lines[2]), 2)
-        server = "Speedtest"
+        download = round(results['download'] / 1_000_000, 2)  # Convert to Mbps
+        upload = round(results['upload'] / 1_000_000, 2)      # Convert to Mbps
+        ping = round(results['ping'], 2)
+        server = results['server'].get('sponsor', 'Speedtest Server')
 
         # Save to CSV
         with open(DB_FILE, 'a', newline='') as f:
             writer = csv.writer(f)
             writer.writerow([timestamp, download, upload, ping, server])
 
-        logger.info(f"✅ Test completed | Download: {download} Mbps | Upload: {upload} Mbps | Ping: {ping} ms")
+        logger.info(f"✅ Test completed | DL: {download} Mbps | UL: {upload} Mbps | Ping: {ping} ms | Server: {server}")
 
-    except subprocess.TimeoutExpired:
-        logger.error("❌ Speedtest timeout (took too long)")
-    except FileNotFoundError:
-        logger.error("❌ speedtest-cli not found. Try: pip install speedtest-cli")
     except Exception as e:
-        logger.error(f"❌ Speedtest error: {str(e)}")
+        logger.error(f"❌ Speedtest failed: {type(e).__name__}: {str(e)}")
 
 # API Endpoints
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({"status": "ok", "timestamp": datetime.utcnow().isoformat()}), 200
+    return jsonify({
+        "status": "ok",
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "message": "App is running"
+    }), 200
 
 @app.route('/latest', methods=['GET'])
 def get_latest():
     """Get latest speedtest result"""
     try:
         if not Path(DB_FILE).exists():
-            return jsonify({"error": "No data yet", "message": "Waiting for first speedtest to complete (1-2 minutes)"}), 404
+            return jsonify({
+                "error": "No data yet",
+                "message": "Waiting for first speedtest to complete (2-5 minutes)"
+            }), 404
 
         with open(DB_FILE, 'r') as f:
             lines = f.readlines()
             if len(lines) <= 1:
-                return jsonify({"error": "No data yet", "message": "Speedtest still running or failed"}), 404
+                return jsonify({
+                    "error": "No data yet",
+                    "message": "Speedtest still running or failed"
+                }), 404
 
             last_line = lines[-1].strip().split(',')
             return jsonify({
@@ -95,6 +105,7 @@ def get_latest():
                 "server": last_line[4]
             }), 200
     except Exception as e:
+        logger.error(f"Error in /latest: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/stats', methods=['GET'])
@@ -117,6 +128,7 @@ def get_stats():
 
             return jsonify({
                 "total_tests": len(data),
+                "last_updated": data[-1]['timestamp'] if data else None,
                 "download": {
                     "avg": round(sum(downloads) / len(downloads), 2),
                     "max": round(max(downloads), 2),
@@ -134,6 +146,7 @@ def get_stats():
                 }
             }), 200
     except Exception as e:
+        logger.error(f"Error in /stats: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/history', methods=['GET'])
@@ -156,13 +169,16 @@ def get_history():
                 row['upload_mbps'] = float(row['upload_mbps'])
                 row['ping_ms'] = float(row['ping_ms'])
 
-            return jsonify({"data": data}), 200
+            return jsonify({"total_records": len(data), "data": data}), 200
     except Exception as e:
+        logger.error(f"Error in /history: {e}")
         return jsonify({"error": str(e)}), 500
 
 # Schedule speedtest to run every hour
 def start_scheduler():
     scheduler = BackgroundScheduler()
+
+    logger.info("📅 Setting up scheduler...")
 
     # Run every hour
     scheduler.add_job(
@@ -174,7 +190,7 @@ def start_scheduler():
         replace_existing=True
     )
 
-    # Also run immediately on startup (with delay to let app stabilize)
+    # Also run immediately on startup
     scheduler.add_job(
         func=run_speedtest,
         trigger="date",
@@ -184,9 +200,13 @@ def start_scheduler():
     )
 
     scheduler.start()
-    logger.info("✅ Scheduler started - speedtest will run every hour + now")
+    logger.info("✅ Scheduler started - speedtest will run now + every hour")
 
 if __name__ == '__main__':
+    logger.info("=" * 60)
+    logger.info("🚀 Starting Speedtest Monitor App")
+    logger.info("=" * 60)
+
     # Initialize database
     init_database()
 
@@ -194,5 +214,6 @@ if __name__ == '__main__':
     start_scheduler()
 
     # Run Flask app
-    logger.info(f"🚀 Starting app on port {PORT}")
-    app.run(host='0.0.0.0', port=PORT, debug=False)
+    logger.info(f"🌐 Starting Flask on port {PORT}")
+    logger.info("=" * 60)
+    app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
