@@ -1,5 +1,6 @@
 import os
 import csv
+import threading
 from datetime import datetime
 from pathlib import Path
 import logging
@@ -7,213 +8,205 @@ from flask import Flask, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
 import speedtest
 
-# Setup logging
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format='[%(asctime)s] [%(levelname)s] %(message)s'
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("speedtest-monitor")
 
-# Initialize Flask app
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
 app = Flask(__name__)
-
-# Database file
 DB_FILE = "speedtest_results.csv"
 PORT = int(os.getenv("PORT", 8000))
 
-# Ensure CSV headers exist
-def init_database():
-    try:
-        if not Path(DB_FILE).exists():
-            with open(DB_FILE, 'w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(['timestamp', 'download_mbps', 'upload_mbps', 'ping_ms', 'server'])
-            logger.info("✅ Database initialized")
-        else:
-            logger.info("✅ Database already exists")
-    except Exception as e:
-        logger.error(f"❌ Failed to init database: {e}")
+# Prevent two speedtests running at the same time
+_test_lock = threading.Lock()
 
-# Run speedtest using speedtest library
+
+# ---------------------------------------------------------------------------
+# Database
+# ---------------------------------------------------------------------------
+def init_database():
+    if not Path(DB_FILE).exists():
+        with open(DB_FILE, 'w', newline='') as f:
+            csv.writer(f).writerow(
+                ['timestamp', 'download_mbps', 'upload_mbps', 'ping_ms', 'server']
+            )
+        logger.info("✅ Database created: %s", DB_FILE)
+    else:
+        logger.info("✅ Database exists: %s", DB_FILE)
+
+
+# ---------------------------------------------------------------------------
+# Speedtest
+# ---------------------------------------------------------------------------
 def run_speedtest():
+    # If a test is already running, skip
+    if not _test_lock.acquire(blocking=False):
+        logger.info("⏭️  Speedtest already running, skipping")
+        return {"error": "Speedtest already running"}
+
     try:
         logger.info("🚀 Starting speedtest...")
+        st = speedtest.Speedtest(secure=True)
 
-        st = speedtest.Speedtest()
         logger.info("📍 Finding best server...")
         st.get_best_server()
 
-        logger.info("⬇️ Testing download speed...")
+        logger.info("⬇️  Testing download...")
         st.download()
 
-        logger.info("⬆️ Testing upload speed...")
+        logger.info("⬆️  Testing upload...")
         st.upload()
 
-        # Get results
-        results = st.results.dict()
+        r = st.results.dict()
+        row = {
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "download_mbps": round(r['download'] / 1_000_000, 2),
+            "upload_mbps": round(r['upload'] / 1_000_000, 2),
+            "ping_ms": round(r['ping'], 2),
+            "server": r['server'].get('sponsor', 'Unknown'),
+        }
 
-        # Extract data
-        timestamp = datetime.utcnow().isoformat() + "Z"
-        download = round(results['download'] / 1_000_000, 2)  # Convert to Mbps
-        upload = round(results['upload'] / 1_000_000, 2)      # Convert to Mbps
-        ping = round(results['ping'], 2)
-        server = results['server'].get('sponsor', 'Speedtest Server')
-
-        # Save to CSV
         with open(DB_FILE, 'a', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow([timestamp, download, upload, ping, server])
+            csv.writer(f).writerow([
+                row["timestamp"], row["download_mbps"],
+                row["upload_mbps"], row["ping_ms"], row["server"]
+            ])
 
-        logger.info(f"✅ Test completed | DL: {download} Mbps | UL: {upload} Mbps | Ping: {ping} ms | Server: {server}")
+        logger.info(
+            "✅ Done | DL: %s Mbps | UL: %s Mbps | Ping: %s ms | %s",
+            row["download_mbps"], row["upload_mbps"],
+            row["ping_ms"], row["server"]
+        )
+        return row
 
     except Exception as e:
-        logger.error(f"❌ Speedtest failed: {type(e).__name__}: {str(e)}")
+        logger.error("❌ Speedtest failed: %s: %s", type(e).__name__, e)
+        return {"error": f"{type(e).__name__}: {e}"}
+    finally:
+        _test_lock.release()
 
-# API Endpoints
-@app.route('/health', methods=['GET'])
-def health():
+
+def _read_rows():
+    if not Path(DB_FILE).exists():
+        return []
+    with open(DB_FILE, 'r') as f:
+        return list(csv.DictReader(f))
+
+
+# ---------------------------------------------------------------------------
+# API endpoints
+# ---------------------------------------------------------------------------
+@app.route('/')
+def home():
     return jsonify({
-        "status": "ok",
-        "timestamp": datetime.utcnow().isoformat() + "Z",
-        "message": "App is running"
+        "app": "Internet Speedtest Monitor",
+        "status": "running",
+        "endpoints": {
+            "/run": "Force a speedtest now (takes 30-60s)",
+            "/latest": "Latest result",
+            "/stats": "Statistics (avg/max/min)",
+            "/history": "All records",
+            "/health": "Health check"
+        }
     }), 200
 
-@app.route('/latest', methods=['GET'])
-def get_latest():
-    """Get latest speedtest result"""
-    try:
-        if not Path(DB_FILE).exists():
-            return jsonify({
-                "error": "No data yet",
-                "message": "Waiting for first speedtest to complete (2-5 minutes)"
-            }), 404
 
-        with open(DB_FILE, 'r') as f:
-            lines = f.readlines()
-            if len(lines) <= 1:
-                return jsonify({
-                    "error": "No data yet",
-                    "message": "Speedtest still running or failed"
-                }), 404
+@app.route('/health')
+def health():
+    return jsonify({"status": "ok", "time": datetime.utcnow().isoformat() + "Z"}), 200
 
-            last_line = lines[-1].strip().split(',')
-            return jsonify({
-                "timestamp": last_line[0],
-                "download_mbps": float(last_line[1]),
-                "upload_mbps": float(last_line[2]),
-                "ping_ms": float(last_line[3]),
-                "server": last_line[4]
-            }), 200
-    except Exception as e:
-        logger.error(f"Error in /latest: {e}")
-        return jsonify({"error": str(e)}), 500
 
-@app.route('/stats', methods=['GET'])
-def get_stats():
-    """Get statistics from all tests"""
-    try:
-        if not Path(DB_FILE).exists():
-            return jsonify({"error": "No data yet"}), 404
+@app.route('/run')
+def force_run():
+    """Force run a speedtest right now and return the result."""
+    result = run_speedtest()
+    if "error" in result:
+        return jsonify(result), 500
+    return jsonify({"message": "Speedtest completed", "result": result}), 200
 
-        with open(DB_FILE, 'r') as f:
-            reader = csv.DictReader(f)
-            data = list(reader)
 
-            if not data:
-                return jsonify({"error": "No data yet"}), 404
+@app.route('/latest')
+def latest():
+    rows = _read_rows()
+    if not rows:
+        return jsonify({"error": "No data yet", "hint": "Call /run to trigger a test"}), 404
+    last = rows[-1]
+    return jsonify({
+        "timestamp": last["timestamp"],
+        "download_mbps": float(last["download_mbps"]),
+        "upload_mbps": float(last["upload_mbps"]),
+        "ping_ms": float(last["ping_ms"]),
+        "server": last["server"],
+    }), 200
 
-            downloads = [float(row['download_mbps']) for row in data]
-            uploads = [float(row['upload_mbps']) for row in data]
-            pings = [float(row['ping_ms']) for row in data]
 
-            return jsonify({
-                "total_tests": len(data),
-                "last_updated": data[-1]['timestamp'] if data else None,
-                "download": {
-                    "avg": round(sum(downloads) / len(downloads), 2),
-                    "max": round(max(downloads), 2),
-                    "min": round(min(downloads), 2)
-                },
-                "upload": {
-                    "avg": round(sum(uploads) / len(uploads), 2),
-                    "max": round(max(uploads), 2),
-                    "min": round(min(uploads), 2)
-                },
-                "ping": {
-                    "avg": round(sum(pings) / len(pings), 2),
-                    "max": round(max(pings), 2),
-                    "min": round(min(pings), 2)
-                }
-            }), 200
-    except Exception as e:
-        logger.error(f"Error in /stats: {e}")
-        return jsonify({"error": str(e)}), 500
+@app.route('/stats')
+def stats():
+    rows = _read_rows()
+    if not rows:
+        return jsonify({"error": "No data yet", "hint": "Call /run to trigger a test"}), 404
 
-@app.route('/history', methods=['GET'])
-def get_history():
-    """Get all speedtest history"""
-    try:
-        if not Path(DB_FILE).exists():
-            return jsonify({"error": "No data yet"}), 404
+    dl = [float(r["download_mbps"]) for r in rows]
+    ul = [float(r["upload_mbps"]) for r in rows]
+    pg = [float(r["ping_ms"]) for r in rows]
 
-        with open(DB_FILE, 'r') as f:
-            reader = csv.DictReader(f)
-            data = list(reader)
+    def summ(v):
+        return {"avg": round(sum(v) / len(v), 2), "max": round(max(v), 2), "min": round(min(v), 2)}
 
-            if not data:
-                return jsonify({"error": "No data yet"}), 404
+    return jsonify({
+        "total_tests": len(rows),
+        "last_updated": rows[-1]["timestamp"],
+        "download": summ(dl),
+        "upload": summ(ul),
+        "ping": summ(pg),
+    }), 200
 
-            # Convert strings to numbers
-            for row in data:
-                row['download_mbps'] = float(row['download_mbps'])
-                row['upload_mbps'] = float(row['upload_mbps'])
-                row['ping_ms'] = float(row['ping_ms'])
 
-            return jsonify({"total_records": len(data), "data": data}), 200
-    except Exception as e:
-        logger.error(f"Error in /history: {e}")
-        return jsonify({"error": str(e)}), 500
+@app.route('/history')
+def history():
+    rows = _read_rows()
+    if not rows:
+        return jsonify({"error": "No data yet", "hint": "Call /run to trigger a test"}), 404
+    for r in rows:
+        r["download_mbps"] = float(r["download_mbps"])
+        r["upload_mbps"] = float(r["upload_mbps"])
+        r["ping_ms"] = float(r["ping_ms"])
+    return jsonify({"total_records": len(rows), "data": rows}), 200
 
-# Schedule speedtest to run every hour
+
+# ---------------------------------------------------------------------------
+# Scheduler — starts at MODULE IMPORT so it works under gunicorn too
+# ---------------------------------------------------------------------------
 def start_scheduler():
-    scheduler = BackgroundScheduler()
+    scheduler = BackgroundScheduler(daemon=True)
 
-    logger.info("📅 Setting up scheduler...")
+    # Every hour
+    scheduler.add_job(run_speedtest, trigger="interval", hours=1,
+                      id="hourly", replace_existing=True)
 
-    # Run every hour
-    scheduler.add_job(
-        func=run_speedtest,
-        trigger="interval",
-        hours=1,
-        id='speedtest_job',
-        name='Speedtest every hour',
-        replace_existing=True
-    )
-
-    # Also run immediately on startup
-    scheduler.add_job(
-        func=run_speedtest,
-        trigger="date",
-        run_date=datetime.now(),
-        id='speedtest_startup',
-        name='Initial speedtest'
-    )
+    # Once shortly after startup (10s delay so the web server is up first)
+    scheduler.add_job(run_speedtest, trigger="date",
+                      run_date=datetime.now(), id="startup")
 
     scheduler.start()
-    logger.info("✅ Scheduler started - speedtest will run now + every hour")
+    logger.info("✅ Scheduler started — runs now + every hour")
+
+
+# This block runs on IMPORT (gunicorn) AND direct run (python app.py)
+logger.info("=" * 55)
+logger.info("🚀 Speedtest Monitor initializing...")
+init_database()
+start_scheduler()
+logger.info("=" * 55)
+
 
 if __name__ == '__main__':
-    logger.info("=" * 60)
-    logger.info("🚀 Starting Speedtest Monitor App")
-    logger.info("=" * 60)
-
-    # Initialize database
-    init_database()
-
-    # Start scheduler
-    start_scheduler()
-
-    # Run Flask app
-    logger.info(f"🌐 Starting Flask on port {PORT}")
-    logger.info("=" * 60)
+    logger.info("🌐 Running Flask dev server on port %s", PORT)
     app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
