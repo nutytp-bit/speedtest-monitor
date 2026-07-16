@@ -1,0 +1,6 @@
+speedtest_results.csv
+__pycache__/
+*.pyc
+.env
+.DS_Store
+*.swp
